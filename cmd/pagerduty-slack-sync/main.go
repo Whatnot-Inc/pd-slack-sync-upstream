@@ -25,6 +25,7 @@ func main() {
 
 	logrus.Infof("starting, going to sync %d schedules", len(config.Schedules))
 
+	syncer := sync.NewSyncer(config)
 	timer := time.NewTicker(time.Second * time.Duration(config.RunIntervalInSeconds))
 
 	for alive := true; alive; {
@@ -34,7 +35,7 @@ func main() {
 			alive = false
 			os.Exit(0)
 		case <-timer.C:
-			err = sync.Schedules(config)
+			err = syncer.Sync()
 			if err != nil {
 				logrus.Errorf("could not sync schedules, error: %v", err)
 				os.Exit(-1)

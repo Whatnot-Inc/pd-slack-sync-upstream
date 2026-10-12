@@ -53,6 +53,12 @@ Full parameter list:
 | PAGERDUTY_SCHEDULE_LOOKAHEAD | How far into the future to evaluate Pagerduty schedules (Go time duration format) | 2400h          | 8760h                   |
 
 
+## Slack rate limits
+
+Each run loads Slack users at most once every 10 minutes and loads every usergroup, including members, with one `usergroups.list` call. `usergroups.users.list` is used only when that list omits members, and at most 15 times per run. A Slack HTTP 429 waits for `Retry-After` and retries once. Further Slack calls in that run wait for the next interval.
+
+A PagerDuty email with no active Slack account is skipped. An empty on-call result does not clear a usergroup, because Slack rejects an empty member list. A PagerDuty schedule that returns 404 is skipped for 30 minutes.
+
 ## Slack permissions
 
 In order for the app to run you will need to create a bot with the following permissions:
