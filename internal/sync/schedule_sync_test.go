@@ -74,6 +74,43 @@ func TestSlackRateLimit(t *testing.T) {
 	}
 }
 
+func TestUserListRateLimit(t *testing.T) {
+	tests := []struct {
+		name       string
+		limits     int
+		userCalls  int
+		groupCalls int
+		errorLog   bool
+	}{
+		{name: "retries once then pauses the rest of the run", limits: 2, userCalls: 2, errorLog: true},
+		{name: "one retry succeeds", limits: 1, userCalls: 2, groupCalls: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logs := captureLogs(t)
+			api := &fakeSlack{
+				users:          []slack.User{slackUser("U1", "a@b.c", false)},
+				userRateLimits: tt.limits,
+				groups: []slack.UserGroup{
+					{ID: "S1", Handle: "current-oncall-platform", Name: "Current", Users: []string{"U1"}},
+					{ID: "S2", Handle: "all-oncall-platforms", Name: "All", Users: []string{"U1"}},
+				},
+			}
+			pd := &fakePD{emails: map[string][]string{"PD1": {"a@b.c"}}}
+			syncer, _, slept := newTestSyncer(api, pd, []Schedule{platformSchedule()})
+
+			require.NoError(t, syncer.Sync())
+
+			assert.Equal(t, tt.userCalls, api.userCalls)
+			assert.Equal(t, tt.groupCalls, api.groupCalls)
+			assert.Equal(t, 0, api.updateCalls)
+			assert.Equal(t, []time.Duration{30 * time.Second}, *slept)
+			assert.Equal(t, tt.errorLog, strings.Contains(logs.String(), "slack rate limit reached"))
+			assert.NotContains(t, logs.String(), "failed to update slack group")
+		})
+	}
+}
+
 func TestRateLimitDelay(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -258,7 +295,9 @@ type fakeSlack struct {
 	groupQueue       [][]slack.UserGroup
 	users            []slack.User
 	members          map[string][]string
+	userRateLimits   int
 	memberRateLimits int
+	userCalls        int
 	createErr        error
 	updateErr        error
 
@@ -281,6 +320,11 @@ func (f *fakeSlack) GetUserGroupsContext(context.Context, ...slack.GetUserGroups
 }
 
 func (f *fakeSlack) GetUsersContext(context.Context, ...slack.GetUsersOption) ([]slack.User, error) {
+	f.userCalls++
+	if f.userRateLimits > 0 {
+		f.userRateLimits--
+		return nil, &slack.RateLimitedError{RetryAfter: 30 * time.Second}
+	}
 	return f.users, nil
 }
 

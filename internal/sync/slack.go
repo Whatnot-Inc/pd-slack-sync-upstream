@@ -132,7 +132,9 @@ func (c *slackClient) ensureUsers() error {
 	if !c.usersAt.IsZero() && c.now().Sub(c.usersAt) < c.userTTL {
 		return nil
 	}
-	users, err := c.api.GetUsersContext(context.Background())
+	users, err := doValue(c, func() ([]slack.User, error) {
+		return c.api.GetUsersContext(context.Background())
+	})
 	if err != nil {
 		if useCached(err, len(c.users) > 0, false, "users") {
 			return nil
