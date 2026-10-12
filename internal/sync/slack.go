@@ -76,25 +76,33 @@ func (c *slackClient) do(call func() error) error {
 	if c.blocked {
 		return c.blockErr
 	}
-	if err := c.wait(); err != nil {
-		return err
-	}
-	err := call()
-	delay, limited := rateLimitDelay(err)
-	if !limited {
-		return err
-	}
-	c.limitedUntil = c.now().Add(delay)
-	if err = c.wait(); err != nil {
-		return err
-	}
-	err = call()
-	if delay, limited = rateLimitDelay(err); limited {
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		if err = c.wait(); err != nil {
+			return err
+		}
+		err = call()
+		delay, limited := rateLimitDelay(err)
+		if !limited {
+			return err
+		}
 		c.limitedUntil = c.now().Add(delay)
-		c.blocked = true
-		c.blockErr = err
+		if attempt == 1 {
+			c.blocked = true
+			c.blockErr = err
+		}
 	}
 	return err
+}
+
+func doValue[T any](c *slackClient, fn func() (T, error)) (T, error) {
+	var out T
+	err := c.do(func() error {
+		var callErr error
+		out, callErr = fn()
+		return callErr
+	})
+	return out, err
 }
 
 func (c *slackClient) wait() error {
@@ -126,8 +134,7 @@ func (c *slackClient) ensureUsers() error {
 	}
 	users, err := c.api.GetUsersContext(context.Background())
 	if err != nil {
-		if len(c.users) > 0 {
-			logrus.Warnf("using cached slack users after refresh failed: %v", formatSlackErr(err))
+		if useCached(err, len(c.users) > 0, false, "users") {
 			return nil
 		}
 		return err
@@ -141,17 +148,10 @@ func (c *slackClient) ensureGroups() error {
 	groups, err := c.listGroups(true)
 	if err != nil && !isRateLimited(err) {
 		logrus.Warnf("slack usergroups.list with members failed, listing groups without members: %v", formatSlackErr(err))
-		var fallbackErr error
-		groups, fallbackErr = c.listGroups(false)
-		if fallbackErr != nil {
-			err = fallbackErr
-		} else {
-			err = nil
-		}
+		groups, err = c.listGroups(false)
 	}
 	if err != nil {
-		if len(c.userGroups) > 0 && isRateLimited(err) {
-			logrus.Warnf("using cached slack usergroups after refresh failed: %v", formatSlackErr(err))
+		if useCached(err, len(c.userGroups) > 0, true, "usergroups") {
 			return nil
 		}
 		return err
@@ -175,19 +175,15 @@ func (c *slackClient) ensureGroups() error {
 }
 
 func (c *slackClient) listGroups(includeUsers bool) ([]slack.UserGroup, error) {
-	var groups []slack.UserGroup
-	err := c.do(func() error {
+	return doValue(c, func() ([]slack.UserGroup, error) {
 		options := []slack.GetUserGroupsOption{
 			slack.GetUserGroupsOptionIncludeDisabled(true),
 		}
 		if includeUsers {
 			options = append(options, slack.GetUserGroupsOptionIncludeUsers(true))
 		}
-		var callErr error
-		groups, callErr = c.api.GetUserGroupsContext(context.Background(), options...)
-		return callErr
+		return c.api.GetUserGroupsContext(context.Background(), options...)
 	})
-	return groups, err
 }
 
 func (c *slackClient) idsForEmails(emails []string) (ids []string, missing []string) {
@@ -224,14 +220,11 @@ func (c *slackClient) createOrGet(name string) (slack.UserGroup, error) {
 		return group, nil
 	}
 
-	var created slack.UserGroup
-	err := c.do(func() error {
-		var callErr error
-		created, callErr = c.api.CreateUserGroupContext(context.Background(), slack.UserGroup{
+	created, err := doValue(c, func() (slack.UserGroup, error) {
+		return c.api.CreateUserGroupContext(context.Background(), slack.UserGroup{
 			Name:   name,
 			Handle: name,
 		})
-		return callErr
 	})
 	if err == nil {
 		if created.Users == nil {
@@ -253,11 +246,8 @@ func (c *slackClient) createOrGet(name string) (slack.UserGroup, error) {
 }
 
 func (c *slackClient) enable(group slack.UserGroup) (slack.UserGroup, error) {
-	var enabled slack.UserGroup
-	err := c.do(func() error {
-		var callErr error
-		enabled, callErr = c.api.EnableUserGroupContext(context.Background(), group.ID)
-		return callErr
+	enabled, err := doValue(c, func() (slack.UserGroup, error) {
+		return c.api.EnableUserGroupContext(context.Background(), group.ID)
 	})
 	if err != nil {
 		return slack.UserGroup{}, err
@@ -280,11 +270,8 @@ func (c *slackClient) enable(group slack.UserGroup) (slack.UserGroup, error) {
 }
 
 func (c *slackClient) listMembers(id string) ([]string, error) {
-	var members []string
-	err := c.do(func() error {
-		var callErr error
-		members, callErr = c.api.GetUserGroupMembersContext(context.Background(), id)
-		return callErr
+	members, err := doValue(c, func() ([]string, error) {
+		return c.api.GetUserGroupMembersContext(context.Background(), id)
 	})
 	if err != nil {
 		return nil, err
@@ -305,60 +292,72 @@ func (c *slackClient) updateMembers(id string, ids []string) error {
 }
 
 func (c *slackClient) setMembers(id string, ids []string) {
-	cp := append([]string(nil), ids...)
-	for i := range c.userGroups {
-		if c.userGroups[i].ID == id {
-			c.userGroups[i].Users = cp
-			return
-		}
+	if i := c.groupIndex(id); i >= 0 {
+		c.userGroups[i].Users = copyIDs(ids)
 	}
 }
 
 func (c *slackClient) putGroup(group slack.UserGroup) {
-	for i := range c.userGroups {
-		if c.userGroups[i].ID == group.ID {
-			if group.Users == nil {
-				group.Users = c.userGroups[i].Users
-			}
-			c.userGroups[i] = group
-			return
+	if i := c.groupIndex(group.ID); i >= 0 {
+		if group.Users == nil {
+			group.Users = c.userGroups[i].Users
 		}
+		c.userGroups[i] = group
+		return
 	}
 	c.userGroups = append(c.userGroups, group)
+}
+
+func (c *slackClient) groupIndex(id string) int {
+	for i := range c.userGroups {
+		if c.userGroups[i].ID == id {
+			return i
+		}
+	}
+	return -1
 }
 
 // findGroup prefers an active handle match. Display names often differ from
 // the handle this service created, and a disabled group is absent from
 // usergroups.list unless include_disabled is set.
 func findGroup(groups []slack.UserGroup, name string) (slack.UserGroup, bool) {
-	var handleDisabled, nameActive, nameDisabled *slack.UserGroup
+	bestRank := 0
+	var best slack.UserGroup
 	for i := range groups {
-		group := groups[i]
-		handleMatch := group.Handle != "" && strings.EqualFold(group.Handle, name)
-		nameMatch := strings.EqualFold(group.Name, name)
-		disabled := group.DateDelete != 0
-		if handleMatch && !disabled {
-			return group, true
-		}
-		if handleMatch && disabled && handleDisabled == nil {
-			cp := group
-			handleDisabled = &cp
-		}
-		if nameMatch && !disabled && nameActive == nil {
-			cp := group
-			nameActive = &cp
-		}
-		if nameMatch && disabled && nameDisabled == nil {
-			cp := group
-			nameDisabled = &cp
+		rank := groupMatchRank(groups[i], name)
+		if rank > bestRank {
+			bestRank = rank
+			best = groups[i]
 		}
 	}
-	for _, group := range []*slack.UserGroup{handleDisabled, nameActive, nameDisabled} {
-		if group != nil {
-			return *group, true
-		}
+	return best, bestRank > 0
+}
+
+func groupMatchRank(group slack.UserGroup, name string) int {
+	handle := group.Handle != "" && strings.EqualFold(group.Handle, name)
+	byName := strings.EqualFold(group.Name, name)
+	if !handle && !byName {
+		return 0
 	}
-	return slack.UserGroup{}, false
+	disabled := group.DateDelete != 0
+	switch {
+	case handle && !disabled:
+		return 4
+	case handle:
+		return 3
+	case !disabled:
+		return 2
+	default:
+		return 1
+	}
+}
+
+func useCached(err error, hasCache, rateLimitOnly bool, kind string) bool {
+	if err == nil || !hasCache || (rateLimitOnly && !isRateLimited(err)) {
+		return false
+	}
+	logrus.Warnf("using cached slack %s after refresh failed: %v", kind, formatSlackErr(err))
+	return true
 }
 
 func isRateLimited(err error) bool {
@@ -367,8 +366,12 @@ func isRateLimited(err error) bool {
 }
 
 func isAlreadyExists(err error) bool {
-	code := slackErrorCode(err)
-	return code == "handle_already_exists" || code == "name_already_exists" || code == "already_exists"
+	switch slackErrorCode(err) {
+	case "handle_already_exists", "name_already_exists", "already_exists":
+		return true
+	default:
+		return false
+	}
 }
 
 func isInvalidArguments(err error) bool {
@@ -376,16 +379,21 @@ func isInvalidArguments(err error) bool {
 }
 
 func slackErrorCode(err error) string {
-	var response slack.SlackErrorResponse
-	if errors.As(err, &response) {
-		return response.Err
+	response, ok := slackError(err)
+	if !ok {
+		return ""
 	}
-	return ""
+	return response.Err
+}
+
+func slackError(err error) (slack.SlackErrorResponse, bool) {
+	var response slack.SlackErrorResponse
+	ok := errors.As(err, &response)
+	return response, ok
 }
 
 func formatSlackErr(err error) string {
-	var response slack.SlackErrorResponse
-	if errors.As(err, &response) && len(response.ResponseMetadata.Messages) > 0 {
+	if response, ok := slackError(err); ok && len(response.ResponseMetadata.Messages) > 0 {
 		return fmt.Sprintf("%s (%s)", response.Err, strings.Join(response.ResponseMetadata.Messages, "; "))
 	}
 	if err == nil {
@@ -394,8 +402,12 @@ func formatSlackErr(err error) string {
 	return err.Error()
 }
 
+func copyIDs(ids []string) []string {
+	return append([]string(nil), ids...)
+}
+
 func joinIDs(ids []string) string {
-	cp := append([]string(nil), ids...)
+	cp := copyIDs(ids)
 	sort.Strings(cp)
 	return strings.Join(cp, ",")
 }

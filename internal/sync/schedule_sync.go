@@ -89,18 +89,10 @@ func (s *Syncer) Sync() error {
 	s.deferred = 0
 	s.rateLimitLogged = false
 
-	if err := s.slack.ensureUsers(); err != nil {
-		if isRateLimited(err) {
-			s.noteRateLimit(err)
-			return nil
-		}
+	if err := s.ignoreRateLimit(s.slack.ensureUsers()); err != nil {
 		return err
 	}
-	if err := s.slack.ensureGroups(); err != nil {
-		if isRateLimited(err) {
-			s.noteRateLimit(err)
-			return nil
-		}
+	if err := s.ignoreRateLimit(s.slack.ensureGroups()); err != nil {
 		return err
 	}
 
@@ -128,19 +120,15 @@ func (s *Syncer) syncGroup(name string, scheduleIDs []string, lookahead time.Dur
 	}
 	ids, missing := s.slack.idsForEmails(emails)
 	for _, email := range missing {
-		s.warnMissing(email)
+		warnOnce(s.warnedEmail, email, "skipping pagerduty user with no active slack account: %s", email)
 	}
 	if len(ids) == 0 {
 		if len(emails) == 0 && !s.allSchedulesSkipped(scheduleIDs) {
-			s.warnEmpty(name)
+			warnOnce(s.warnedEmpty, name, "skipping slack group %s: no slack users to sync", name)
 		}
 		return
 	}
-	if err := s.applyGroup(name, ids); err != nil {
-		if isRateLimited(err) {
-			s.noteRateLimit(err)
-			return
-		}
+	if err := s.applyGroup(name, ids); err != nil && s.ignoreRateLimit(err) != nil {
 		logrus.Errorf("failed to update slack group %s: %v", name, formatSlackErr(err))
 	}
 }
@@ -172,7 +160,7 @@ func (s *Syncer) applyGroup(name string, desired []string) error {
 	}
 
 	if group.Users != nil && sameMembers(group.Users, desired) {
-		s.remember(name, desired)
+		s.remember(name, desired, false)
 		return nil
 	}
 
@@ -187,7 +175,7 @@ func (s *Syncer) applyGroup(name string, desired []string) error {
 			return err
 		}
 		if sameMembers(current, desired) {
-			s.remember(name, desired)
+			s.remember(name, desired, false)
 			return nil
 		}
 	}
@@ -196,25 +184,22 @@ func (s *Syncer) applyGroup(name string, desired []string) error {
 	if err := s.slack.updateMembers(group.ID, desired); err != nil {
 		if isInvalidArguments(err) {
 			// The same payload will fail again. Wait until membership changes.
-			s.members[name] = memberState{
-				ids:         append([]string(nil), desired...),
-				at:          s.now(),
-				rejected:    true,
-				rejectedKey: key,
-			}
+			s.remember(name, desired, true)
 		}
 		return err
 	}
-	s.remember(name, desired)
+	s.remember(name, desired, false)
 	s.slack.setMembers(group.ID, desired)
 	return nil
 }
 
-func (s *Syncer) remember(name string, ids []string) {
-	s.members[name] = memberState{
-		ids: append([]string(nil), ids...),
-		at:  s.now(),
+func (s *Syncer) remember(name string, ids []string, rejected bool) {
+	state := memberState{ids: copyIDs(ids), at: s.now()}
+	if rejected {
+		state.rejected = true
+		state.rejectedKey = joinIDs(ids)
 	}
+	s.members[name] = state
 }
 
 func (s *Syncer) emailsFor(ids []string, lookahead time.Duration) ([]string, error) {
@@ -227,10 +212,7 @@ func (s *Syncer) emailsFor(ids []string, lookahead time.Duration) ([]string, err
 		if err != nil {
 			if isScheduleNotFound(err) {
 				s.skipScheduleUntil[id] = s.now().Add(s.scheduleCooldown)
-				if _, warned := s.warnedSchedule[id]; !warned {
-					logrus.Warnf("pagerduty schedule %s was not found; skipping it for %s", id, s.scheduleCooldown)
-					s.warnedSchedule[id] = struct{}{}
-				}
+				warnOnce(s.warnedSchedule, id, "pagerduty schedule %s was not found; skipping it for %s", id, s.scheduleCooldown)
 				continue
 			}
 			return nil, err
@@ -254,20 +236,20 @@ func (s *Syncer) allSchedulesSkipped(ids []string) bool {
 	return true
 }
 
-func (s *Syncer) warnMissing(email string) {
-	if _, ok := s.warnedEmail[email]; ok {
+func warnOnce(seen map[string]struct{}, key, format string, args ...any) {
+	if _, ok := seen[key]; ok {
 		return
 	}
-	s.warnedEmail[email] = struct{}{}
-	logrus.Warnf("skipping pagerduty user with no active slack account: %s", email)
+	seen[key] = struct{}{}
+	logrus.Warnf(format, args...)
 }
 
-func (s *Syncer) warnEmpty(name string) {
-	if _, ok := s.warnedEmpty[name]; ok {
-		return
+func (s *Syncer) ignoreRateLimit(err error) error {
+	if !isRateLimited(err) {
+		return err
 	}
-	s.warnedEmpty[name] = struct{}{}
-	logrus.Warnf("skipping slack group %s: no slack users to sync", name)
+	s.noteRateLimit(err)
+	return nil
 }
 
 func (s *Syncer) noteRateLimit(err error) {
@@ -279,9 +261,7 @@ func (s *Syncer) noteRateLimit(err error) {
 }
 
 func sameMembers(a, b []string) bool {
-	left := append([]string(nil), a...)
-	right := append([]string(nil), b...)
-	return compare.Array(left, right)
+	return compare.Array(copyIDs(a), copyIDs(b))
 }
 
 func isScheduleNotFound(err error) bool {
