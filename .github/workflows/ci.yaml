@@ -1,0 +1,60 @@
+name: ci
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write  # Required for OIDC token generation
+  contents: read   # Required for repository access
+  packages: write  # Required for docker build
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: CI
+        run: make ci
+
+  build-and-push-docker:
+    uses: Whatnot-Inc/gha-workflows/.github/workflows/docker-build-push.yml@v2
+    with:
+      service: pd-slack-sync
+      dockerfile: build/package/Dockerfile
+    secrets: inherit
+
+  trigger-deployment:
+    runs-on: ubuntu-slim
+
+    if: github.ref == 'refs/heads/main'
+
+    needs:
+      - test
+      - build-and-push-docker
+
+    steps:
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          app-id: ${{ secrets.CD_BOT_APP_ID }}
+          private-key: ${{ secrets.CD_BOT_APP_PRIVATE_KEY }}
+
+      - name: Trigger cd
+        id: trigger-cd
+        uses: peter-evans/repository-dispatch@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          event-type: deploy-me

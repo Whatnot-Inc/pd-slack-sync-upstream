@@ -2,7 +2,11 @@
   <img src="./synclogo.png">
 </p>
 
+## Whatnot deploy
 
+A merge to `main` builds this image, pushes it to
+`407057261112.dkr.ecr.us-east-1.amazonaws.com/pd-slack-sync`, and deploys the
+utility chart in `services-deploy`.
 
 This tool syncs one or more pagerduty schedules to two slack groups per schedule.  The first slack group is a group with everyone who is in the pagerduty schedule and the second contains the current person on call.
 

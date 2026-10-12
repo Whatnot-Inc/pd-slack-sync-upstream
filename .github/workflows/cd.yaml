@@ -1,0 +1,27 @@
+name: cd
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: >
+          Manual pd-slack-sync deployment to utility environment.
+        required: false
+  repository_dispatch:
+    types: [deploy-me]
+
+concurrency:
+  group: cd
+  cancel-in-progress: true
+
+jobs:
+  cd:
+    uses: Whatnot-Inc/gha-workflows/.github/workflows/cd.yml@v2
+    with:
+      service: pd-slack-sync
+      deploy-repo: services-deploy
+      deploy-folder: pd-slack-sync
+      freeze-repo: false
+      image-name: pd-slack-sync
+      image-wait-time-mins: 10
+    secrets: inherit
