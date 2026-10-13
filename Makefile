@@ -13,10 +13,7 @@ test:
 	@go test -v ./...
 
 docker-build:
-	@docker build -t kevholditch/pagerduty-slack-sync:${TAG} -f build/package/Dockerfile .
-
-docker-publish:
-	@docker login
+	@docker build -t pd-slack-sync:${TAG} -f build/package/Dockerfile .
 
 ci: build check test
 
