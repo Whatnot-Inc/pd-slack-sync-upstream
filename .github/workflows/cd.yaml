@@ -24,4 +24,5 @@ jobs:
       freeze-repo: false
       image-name: pd-slack-sync
       image-wait-time-mins: 10
+      tag: ${{ inputs.tag }}
     secrets: inherit
